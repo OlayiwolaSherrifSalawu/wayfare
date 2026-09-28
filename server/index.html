@@ -128,11 +128,19 @@
   h1 { font-size: var(--text-xl); margin: 0 0 .3rem; letter-spacing: -0.02em; }
   .sub { color: var(--muted); font-size: var(--text-md); margin: 0; }
   .controls { display: flex; gap: .6rem; flex-wrap: wrap; align-items: center; margin-bottom: 1.5rem; }
-  select, button {
+  select, button, .sizes-input {
     font: inherit; padding: .65rem .85rem; border-radius: var(--radius-sm);
     border: 1px solid var(--border); background: var(--panel); color: var(--ink);
     transition: border-color .15s ease, box-shadow .15s ease, background .15s ease;
   }
+  .sizes-input { font-family: var(--mono); width: 21rem; max-width: 100%; }
+  /* A sizes value the page refused (invalid fragment, or a server 400 with
+     invalid_sizes) keeps its field outlined in the error colour while the
+     banner explains why. This is error feedback, the same family as .err —
+     not an interactive state, so it does not join the state contract block.
+     The flag is aria-invalid, so what assistive tech announces and what is
+     painted are the same fact, and navigating again clears both. */
+  .sizes-input[aria-invalid="true"] { border-color: var(--bad); }
   button { cursor: pointer; font-weight: 600; }
 
   /* Interactive state contract (issue #285) -------------------------------
@@ -164,14 +172,15 @@
      UNDETERMINED metric state keep their own palette and are never
      referenced from these rules. */
   @media (hover: hover) {
-    button:hover:not(:disabled), select:hover:not(:disabled) {
+    button:hover:not(:disabled), select:hover:not(:disabled),
+    .sizes-input:hover:not(:disabled) {
       border-color: var(--accent); background: var(--panel-alt);
     }
   }
   button:active:not(:disabled) {
     background: var(--panel-alt); box-shadow: var(--press-shadow);
   }
-  button:focus-visible, select:focus-visible {
+  button:focus-visible, select:focus-visible, .sizes-input:focus-visible {
     outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring);
   }
   /* The reload link inside an error banner is the only inline anchor; it
@@ -389,6 +398,13 @@
     <select id="to" aria-label="Select a corridor to measure">
       <option value="" disabled selected>Loading corridors…</option>
     </select>
+    <label for="sizes">Sizes</label>
+    <input id="sizes" name="sizes" type="text" inputmode="decimal"
+      autocomplete="off" spellcheck="false" class="sizes-input"
+      value="0.1,1,5,10,25,50,100,250,500,1000,2500,5000"
+      aria-label="Comma-separated send sizes in USDC; leave unchanged for the default ladder"
+      aria-describedby="sizes-help">
+    <span id="sizes-help" class="case">USDC, comma-separated</span>
     <span id="cs-detail" class="cs-info"></span>
     <button id="run">Measure live</button>
     <button id="trend">Show trend</button>
@@ -567,6 +583,9 @@ function buildSelector(data) {
   updateCorridorDetail(sel.value);
   sel.addEventListener('change', () => {
     updateCorridorDetail(sel.value);
+    // URL-first (issue #292): a corridor change is a navigation. The sizes
+    // the reader typed carry over — they describe how to measure, not which
+    // corridor — and the URL bar is updated through the shared path.
     loadCorridor(sel.value);
   });
 }
@@ -615,7 +634,172 @@ function showErrorBanner(message) {
     `<div class="panel err" role="alert">${message}</div>`);
 }
 
-// --- Measurement -------------------------------------------------------------
+// --- URL-addressable state (issue #292) -------------------------------------
+//
+// The page's measurement state lives in the address bar: ?to=NGNC&sizes=…&live=1.
+// A measurement can be linked, reloaded, and shared; the back button walks the
+// corridor history. Two rules govern it:
+//
+//  1. "If a measurement was possible, the URL reflects it, not the default."
+//     After every successful load or measurement the URL is replaced (not
+//     pushed) to the exact request that produced the reading on screen —
+//     the wire's default-ladder shape, not the input's literal text.
+//  2. "The URL wins." A boot with a parseable ?to= shows that corridor and
+//     overrides the has-history-first sort, because a link's reader chose it.
+//     An absent or unparseable ?to= falls back to the previous boot order.
+//     sizes= and live= are honoured only when ?to= is honoured — the corridor
+//     is the state a link is about, and URL fragments never apply partially.
+//
+// The serialised form is deliberately the /api/corridor wire shape:
+// a ?sizes= that would 400 is never written into history.
+
+// defaultSizesStr is the wire's default ladder (route.DefaultSizes), rendered
+// as the serialised form the URL state round-trips through.
+const DEFAULT_SIZES_STR = '0.1,1,5,10,25,50,100,250,500,1000,2500,5000';
+
+// parseSizesInput is the UI-side mirror of the server's sizes= validation
+// (server/api.go): decimal, positive, at most 24. A value it rejects would be
+// rejected by the server too, so an invalid one is refused here first with the
+// same effect as a 400 — the request is not made. It returns the normalised
+// string (canonical decimal rendering, comma-joined) so a user-entered "5.0"
+// and a URL's "5" produce the same request.
+function parseSizesInput(raw) {
+  const parts = String(raw).split(',').map(s => s.trim()).filter(s => s !== '');
+  if (!parts.length) return { ok: false, reason: 'no sizes given' };
+  if (parts.length > 24) return { ok: false, reason: `too many sizes (${parts.length}); the limit is 24` };
+  const seen = new Set();
+  const out = [];
+  for (const p of parts) {
+    if (!/^\d+(\.\d+)?$/.test(p)) return { ok: false, reason: `'${p}' is not a decimal number` };
+    const d = parseFloat(p);
+    if (!(d > 0)) return { ok: false, reason: `'${p}' is not a positive size` };
+    if (seen.has(p)) continue;
+    seen.add(p);
+    out.push(p);
+  }
+  return { ok: true, norm: out.join(',') };
+}
+
+// readURLState reads the current address bar. to/sizes/live are the three
+// pieces of state the page owns. An unparseable to= yields null, which the
+// callers treat as "no URL state" — never as a corridor name.
+function readURLState() {
+  const q = new URLSearchParams(window.location.search);
+  const to = (q.get('to') || '').trim().toUpperCase();
+  const sizesRaw = q.get('sizes');
+  const live = q.get('live');
+  if (!to || !/^[A-Z0-9]{2,12}$/.test(to)) return null;
+  return { to, sizes: sizesRaw === null ? null : sizesRaw, live: live !== null && live !== '0' };
+}
+
+// sizesOrDefault resolves a URL sizes fragment to a request value. Absent or
+// blank falls back to the default ladder. Present-but-invalid keeps the raw
+// string on the result (raw) so the request can carry it verbatim and fail
+// loudly server-side with invalid_sizes — the URL names a request, and a
+// request the engine would refuse must never be silently swapped for the
+// default ladder.
+function sizesOrDefault(raw) {
+  if (raw === null || String(raw).trim() === '') return { ok: true, norm: DEFAULT_SIZES_STR, raw: raw };
+  const r = parseSizesInput(raw);
+  r.raw = raw;
+  return r;
+}
+
+// urlCorridorRequest builds the /api/corridor query for a URL state: the
+// corridor, its sizes (validated, default ladder when absent), and live=1
+// when the URL asked for live. Returns null when the state names no corridor
+// this build could measure.
+function urlCorridorRequest(st) {
+  if (!st) return null;
+  const sz = sizesOrDefault(st.sizes);
+  return { to: st.to, sizes: sz, live: st.live };
+}
+
+// writeURLState replaces the address bar (replaceState: the back button stays
+// a history of *states*, not of keystrokes) with the exact request that
+// produced the reading on screen — sizes omitted when they are the default
+// ladder, so the serialised form is always a request the API accepts.
+function writeURLState({ to, sizes = DEFAULT_SIZES_STR, live = false } = {}) {
+  const q = new URLSearchParams();
+  q.set('to', to);
+  if (sizes && sizes !== DEFAULT_SIZES_STR) q.set('sizes', sizes);
+  if (live) q.set('live', '1');
+  const qs = q.toString();
+  window.history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : ''));
+}
+
+// navigateTo is the URL-first path every state change goes through: update
+// the bar, then render exactly what the bar says. With no argument it reads
+// the current URL, so back/forward and a manual address-bar edit are handled
+// by the same code as a link. Popstate and the input's Enter both land here,
+// so the bar is never a mirror the reader has to trust — it is the input.
+async function navigateTo(next) {
+  if (next) writeURLState(next);
+  const st = readURLState();
+  if (!st) {
+    $('to').value = '';
+    $('out').innerHTML = `<div class="panel">${emptyState({
+      title: 'No corridor selected',
+      body: 'Choose a destination asset above, then measure it.',
+    })}</div>`;
+    return;
+  }
+  // Keep the selector on the URL's corridor when the assets list knows it;
+  // an unknown code stays selected-in-the-bar only (the request will 400 and
+  // the banner will say so, exactly like a hand-typed API call).
+  if ([...$('to').options].some(o => o.value === st.to)) $('to').value = st.to;
+  const sz = sizesOrDefault(st.sizes);
+  // The sizes input mirrors the URL only when the URL itself carries sizes=;
+  // otherwise the reader's in-progress typing survives an otherwise-failed
+  // navigation (the same preserve-on-error rule as #293). A refused value is
+  // shown as typed, so the reader can see what the URL asked for and fix it.
+  if (st.sizes !== null) $('sizes').value = st.sizes;
+  if (!sz.ok) {
+    $('sizes').setAttribute('aria-invalid', 'true');
+  } else {
+    $('sizes').removeAttribute('aria-invalid');
+  }
+
+  $('status').textContent = 'measuring…';
+  try {
+    if (!sz.ok) {
+      // Fail before the request, exactly as measure() does for typed input:
+      // the URL's sizes fragment names a request this build must not make.
+      throw Object.assign(new Error(sz.reason + ' — fix the sizes field and retry'), { code: 'invalid_sizes' });
+    }
+    const r = await fetch(corridorQuery(st.to, sz, st.live));
+    const data = await r.json();
+    if (!r.ok) throw Object.assign(new Error(data.error || `HTTP ${r.status}`), { code: data.code });
+    render(data);
+    writeURLState({ to: st.to, sizes: sz.ok ? sz.norm : DEFAULT_SIZES_STR, live: st.live });
+  } catch (e) {
+    if (e.code === 'invalid_sizes') $('sizes').setAttribute('aria-invalid', 'true');
+    // The wake-up hint applies to upstream timeouts, not to a request this
+    // page refused to make; a refused sizes fragment gets no reload link,
+    // because reloading will refuse again.
+    const hint = (e.code === 'invalid_sizes')
+      ? ''
+      : ' If the instance is still waking up, wait a moment and <a href="" style="color:inherit">reload</a>.';
+    showErrorBanner(`Could not load corridor data: ${esc(e.message)}.${hint}`);
+  } finally {
+    $('status').textContent = '';
+    $('run').disabled = false;
+  }
+}
+
+// corridorQuery is the one place a /api/corridor URL is built. `sizes` is the
+// already-validated result of parseSizesInput or sizesOrDefault and MUST be
+// ok — navigateTo throws on a refused fragment before reaching here, and
+// measure() refuses before it too — so every request this builds is one the
+// API's sizes contract accepts. `live` forces a live measurement. Every
+// caller — URL navigation, the live button, the selector, boot — produces the
+// same request shape for the same state.
+function corridorQuery(to, sizes, live) {
+  let q = `to=${encodeURIComponent(to)}`;
+  if (sizes && sizes.ok && sizes.norm !== DEFAULT_SIZES_STR) q += `&sizes=${encodeURIComponent(sizes.norm)}`;
+  if (live) q += '&live=1';
+  return `/api/corridor?${q}`;
+}
 
 async function measure() {
   const to = $('to').value;
@@ -629,15 +813,26 @@ async function measure() {
       })}</div>`;
     return;
   }
+  const sizes = parseSizesInput($('sizes').value);
+  if (!sizes.ok) {
+    // Refuse the request the server would refuse: mark the field, announce
+    // the reason, and change nothing else — the reading on screen stays.
+    $('sizes').setAttribute('aria-invalid', 'true');
+    showErrorBanner(`Could not measure: ${esc(sizes.reason)} — fix the sizes field and retry.`);
+    return;
+  }
   $('run').disabled = true;
   $('status').textContent = 'measuring live — a full ladder is a dozen round trips…';
   try {
-    const r = await fetch(`/api/corridor?to=${encodeURIComponent(to)}&live=1`);
+    const r = await fetch(corridorQuery(to, sizes, true));
     const data = await r.json();
     if (!r.ok) throw Object.assign(new Error(data.error || `HTTP ${r.status}`), { code: data.code });
     render(data);
+    // Reflect the exact request that produced this reading.
+    writeURLState({ to, sizes: sizes.norm, live: true });
     $('status').textContent = '';
   } catch (e) {
+    if (e.code === 'invalid_sizes') $('sizes').setAttribute('aria-invalid', 'true');
     showErrorBanner(`Could not measure: ${esc(e.message)}`);
     $('status').textContent = '';
   } finally {
@@ -649,6 +844,13 @@ async function measure() {
 // the server uses to say "this build cannot service that request at all" is a
 // capability gap, not a corridor that measured empty, so it renders as one;
 // everything else is a genuine unavailable-data error naming the cause.
+//
+// Currently unreferenced: the fetch paths show errors through showErrorBanner
+// (which preserves the page, #293) rather than replacing it. It stays because
+// its unknown_receive_asset branch is the only mapping of that code to the
+// capability-gap empty state, and a future caller that renders an error in
+// place of the page should route through it rather than re-deriving that
+// mapping. Flagged for removal if it gains no caller.
 function errorPanel(prefix, e) {
   if (e.code === 'unknown_receive_asset') {
     return `<div class="panel">${capabilityGap(
@@ -1267,6 +1469,10 @@ function runsTable(runs) {
 
 $('run').addEventListener('click', measure);
 $('trend').addEventListener('click', loadTrend);
+$('sizes').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); measure(); }
+});
+window.addEventListener('popstate', () => { navigateTo(); });
 
 async function loadCorridor(to) {
   if (!to) {
@@ -1277,26 +1483,34 @@ async function loadCorridor(to) {
       })}</div>`;
     return;
   }
-  try {
-    const r = await fetch(`/api/corridor?to=${encodeURIComponent(to)}`);
-    const data = await r.json();
-    if (!r.ok) throw Object.assign(new Error(data.error || `HTTP ${r.status}`), { code: data.code });
-    render(data);
-  } catch (e) {
-    showErrorBanner(
-      `Could not load corridor data: ${esc(e.message)}. If the instance is still waking up, wait a moment and <a href="" style="color:inherit">reload</a>.`);
-  }
+  // URL-first: the selector is the state's mirror, not its source. Writing
+  // the corridor into the bar and reading it back keeps one code path for
+  // links, reloads, back/forward and interaction.
+  writeURLState({ to, sizes: readURLState()?.sizes ?? null, live: readURLState()?.live ?? false });
+  await navigateTo();
 }
 
 // On page load, populate the corridor selector from /api/assets first, then
-// fetch the initial corridor from recorded history (no &live=1) so the loading
-// state disappears as soon as the server responds, regardless of whether this
-// is a cold start or a warm one.  A cold start on Render's free tier can take
-// ~60 s; the loading panel explains this to the reader.
+// render the corridor the address bar names. A parseable ?to= wins over the
+// has-history-first sort — the reader of a link chose that corridor — while an
+// absent or unparseable ?to= keeps the previous boot order (history first,
+// then NGNC as the case-study default). The initial load is from recorded
+// history (no &live=1) so the loading state disappears as soon as the server
+// responds, regardless of whether this is a cold start or a warm one; ?live=1
+// asks for and gets a live measurement. A cold start on Render's free tier can
+// take ~60 s; the loading panel explains this to the reader.
 (async function boot() {
   await loadAssets();
-  const to = $('to').value || 'NGNC';
-  await loadCorridor(to);
+  const url = readURLState();
+  if (url) {
+    await navigateTo();
+    return;
+  }
+  const opts = [...$('to').options].filter(o => o.value);
+  const preferred = opts.find(o => o.value === 'NGNC') || opts[0];
+  const to = (preferred && preferred.value) || 'NGNC';
+  writeURLState({ to, sizes: null, live: false });
+  await navigateTo();
 })();
 </script>
 <script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a30a05c3d811663d',t:'MTc4NzY1NDg4Nw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
